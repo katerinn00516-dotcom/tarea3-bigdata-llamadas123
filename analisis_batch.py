@@ -1,17 +1,13 @@
-cat > analisis_batch.py << 'EOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Tarea 3 - Big Data (UNAD)
-Procesamiento en BATCH con Apache Spark (PySpark)
+# Tarea 3 - Big Data (UNAD) - Procesamiento BATCH con Apache Spark
+#
+# Problema: servicios de emergencia en salud de la linea 123 (Bogota) que NO registran
+# recepcion del paciente (RECEPCION vacia), usado como indicador aproximado de servicios
+# que terminan sin traslado. El dataset no distingue ambulancia basica / medicalizada.
+#
+# Uso: spark-submit analisis_batch.py llamadas123_utf8.csv
 
-Problema: servicios de ambulancia (basica y medicalizada) que terminan SIN traslado
-del paciente. Datos: Llamadas de Urgencias y Emergencias - Linea 123 (Datos Abiertos Bogota).
-
-Uso:
-    spark-submit analisis_batch.py llamadas123_julio2025.csv --explorar
-    spark-submit analisis_batch.py llamadas123_julio2025.csv
-"""
 import os
 import re
 import sys
@@ -22,21 +18,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ----------------------------------------------------------------------------
-# CONFIGURACION (ajustar despues de correr con --explorar)
-# ----------------------------------------------------------------------------
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
-CSV_PATH = args[0] if args else "llamadas123_julio2025.csv"
-MODO_EXPLORAR = "--explorar" in sys.argv
+CSV_PATH = args[0] if args else "llamadas123_utf8.csv"
 OUT_DIR = "resultados_batch"
-ENCODING = "UTF-8"
-
-REGEX_MEDICALIZADA = "MEDICALIZ"
-REGEX_BASICA = "BASIC"
-REGEX_SIN_TRASLADO = "SIN TRASLADO|NO TRASLAD|NO REQUIERE TRASLADO|SIN_TRASLADO|NO SE TRASLAD"
-COLS_TEXTO_TRASLADO = ["TIPO_INCIDENTE", "CLASIFICACION_FINAL"]
-# ----------------------------------------------------------------------------
-
+ENCODING = "UTF-8"   # el CSV original esta en CP850; se convierte antes con iconv
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
@@ -58,26 +43,13 @@ with open(CSV_PATH, encoding=ENCODING, errors="ignore") as f:
 SEP = ";" if cabecera.count(";") > cabecera.count(",") else ","
 
 df = (spark.read.option("header", True).option("sep", SEP)
-      .option("encoding", ENCODING)
+      .option("encoding", ENCODING).option("nullValue", "NULL")
       .csv("file://" + os.path.abspath(CSV_PATH)))
 df = df.toDF(*[norm(c) for c in df.columns])
 
 print("\n=== 1. CARGA ===")
-print("Separador detectado:", repr(SEP))
 print("Columnas:", df.columns)
-df.printSchema()
 print("Registros cargados:", df.count())
-
-if MODO_EXPLORAR:
-    df.show(5, truncate=False)
-    for c in ["UNIDAD", "TIPO_INCIDENTE", "CLASIFICACION_FINAL", "PRIORIDAD",
-              "PRIORIDAD_FINAL", "GENERO", "RECEPCION", "RED"]:
-        if c in df.columns:
-            print("\n--- Valores de", c, "---")
-            df.groupBy(c).count().orderBy(F.desc("count")).show(30, truncate=False)
-    print("\nModo exploracion terminado: ajuste las REGEX de la seccion CONFIGURACION.")
-    spark.stop()
-    sys.exit(0)
 
 # ----------------------------------------------------------------------------
 # 2. LIMPIEZA Y TRANSFORMACION
@@ -88,81 +60,97 @@ SIN_TILDE = "AEIOUUN"
 for c, t in df.dtypes:
     if t == "string":
         col = F.translate(F.upper(F.trim(F.col(c))), CON_TILDE, SIN_TILDE)
-        df = df.withColumn(c, F.when(col == "", None).otherwise(col))
+        df = df.withColumn(c, F.when(col.isin("", "NULL"), None).otherwise(col))
 
 n0 = df.count()
 df = df.dropDuplicates()
 print("Duplicados eliminados:", n0 - df.count())
 
-print("Nulos por columna:")
-df.select([F.sum(F.col(c).isNull().cast("int")).alias(c) for c in df.columns]).show(truncate=False)
+# Fila con datos de paciente (GENERO distinto de N/A)
+df = df.withColumn("PACIENTE_REGISTRADO",
+                   F.when(F.col("GENERO").isNull() | (F.col("GENERO") == "N/A"), 0).otherwise(1))
+for c, t in df.dtypes:
+    if t == "string":
+        df = df.withColumn(c, F.when(F.col(c) == "N/A", None).otherwise(F.col(c)))
 
-if "EDAD" in df.columns:
-    df = df.withColumn("EDAD_NUM", F.regexp_extract("EDAD", r"(\d+)", 1).cast("int"))
-    df = df.withColumn("EDAD_NUM", F.when((F.col("EDAD_NUM") >= 0) & (F.col("EDAD_NUM") <= 110),
-                                          F.col("EDAD_NUM")))
-    df = df.withColumn(
-        "RANGO_EDAD",
-        F.when(F.col("EDAD_NUM").isNull(), "SIN DATO")
-         .when(F.col("EDAD_NUM") < 12, "0-11")
-         .when(F.col("EDAD_NUM") < 18, "12-17")
-         .when(F.col("EDAD_NUM") < 30, "18-29")
-         .when(F.col("EDAD_NUM") < 60, "30-59")
-         .otherwise("60+"))
+# UNIDAD es la unidad de la EDAD (anos / meses / dias), no el tipo de ambulancia
+df = df.withColumnRenamed("UNIDAD", "UNIDAD_EDAD")
+edad = F.regexp_extract("EDAD", r"(\d+)", 1).cast("int")
+df = df.withColumn(
+    "EDAD_ANIOS",
+    F.when(F.col("EDAD").isNull(), F.lit(None).cast("int"))
+     .when(F.col("UNIDAD_EDAD").rlike("^ANO"), edad)
+     .when(F.col("UNIDAD_EDAD").rlike("^(MES|DIA)"), F.lit(0)))
+df = df.withColumn("EDAD_ANIOS", F.when(F.col("EDAD_ANIOS").between(0, 110), F.col("EDAD_ANIOS")))
+df = df.withColumn(
+    "RANGO_EDAD",
+    F.when(F.col("EDAD_ANIOS").isNull(), "SIN DATO")
+     .when(F.col("EDAD_ANIOS") < 12, "0-11")
+     .when(F.col("EDAD_ANIOS") < 18, "12-17")
+     .when(F.col("EDAD_ANIOS") < 30, "18-29")
+     .when(F.col("EDAD_ANIOS") < 60, "30-59")
+     .otherwise("60+"))
 
-cols_fecha = [c for c in df.columns if c.startswith("FECHA")]
-if cols_fecha:
-    cf = cols_fecha[0]
-    ts = F.coalesce(F.to_timestamp(cf, "yyyy-MM-dd HH:mm:ss"),
-                    F.to_timestamp(cf, "yyyy-MM-dd'T'HH:mm:ss"),
-                    F.to_timestamp(cf, "dd/MM/yyyy HH:mm:ss"),
-                    F.to_timestamp(cf, "dd/MM/yyyy HH:mm"),
-                    F.to_timestamp(cf, "yyyy-MM-dd HH:mm"))
-    df = df.withColumn("FECHA_TS", ts).withColumn("HORA", F.hour("FECHA_TS"))
-    print("Columna de fecha usada:", cf)
 
-tipo = (F.when(F.col("UNIDAD").rlike(REGEX_MEDICALIZADA), "MEDICALIZADA")
-         .when(F.col("UNIDAD").rlike(REGEX_BASICA), "BASICA")
-         .otherwise("OTRA"))
-df = df.withColumn("TIPO_AMBULANCIA", tipo)
+def a_ts(c):
+    # Convierte textos como 2025-07 01 00:05:50 en timestamp
+    limpio = F.regexp_replace(
+        F.col(c), r"^(\d{4})\D+(\d{2})\D+(\d{2})\D+(\d{2}:\d{2}:\d{2}).*$", "$1-$2-$3 $4")
+    return F.to_timestamp(limpio, "yyyy-MM-dd HH:mm:ss")
 
-cols_txt = [c for c in COLS_TEXTO_TRASLADO if c in df.columns]
-texto = F.concat_ws(" ", *[F.coalesce(F.col(c), F.lit("")) for c in cols_txt])
-df = df.withColumn("SIN_TRASLADO", texto.rlike(REGEX_SIN_TRASLADO).cast("int"))
 
-amb = df.filter(F.col("TIPO_AMBULANCIA") != "OTRA").cache()
-total_amb = amb.count()
-print("\nServicios de ambulancia (basica + medicalizada):", total_amb)
-if total_amb == 0:
-    print("!! No se detectaron ambulancias: revise REGEX_BASICA / REGEX_MEDICALIZADA con --explorar")
-    sys.exit(1)
-if amb.filter("SIN_TRASLADO = 1").count() == 0:
-    print("!! Ningun servicio marcado SIN_TRASLADO: revise REGEX_SIN_TRASLADO con --explorar")
+cf = [c for c in df.columns if c.startswith("FECHA")][0]
+df = (df.withColumn("FECHA_TS", a_ts(cf))
+        .withColumn("RECEPCION_TS", a_ts("RECEPCION"))
+        .withColumn("HORA", F.hour("FECHA_TS"))
+        .withColumn("DIA_SEMANA", F.date_format("FECHA_TS", "E")))
+mins = (F.unix_timestamp("RECEPCION_TS") - F.unix_timestamp("FECHA_TS")) / 60
+df = df.withColumn("MIN_A_RECEPCION", F.when(mins >= 0, mins))
+
+# Variable objetivo (indicador aproximado de "sin traslado")
+df = df.withColumn("SIN_RECEPCION", F.col("RECEPCION").isNull().cast("int"))
+# Nombre corto del incidente (texto antes del guion)
+df = df.withColumn("TIPO_CORTO", F.trim(F.split(F.col("TIPO_INCIDENTE"), " - ").getItem(0)))
+
+df = df.cache()
+total = df.count()
+print("Registros tras limpieza:", total)
+print("Fechas de despacho interpretadas:", df.filter("FECHA_TS is not null").count())
+print("Fechas de recepcion interpretadas:", df.filter("RECEPCION_TS is not null").count())
+print("Servicios SIN recepcion:", df.filter("SIN_RECEPCION = 1").count())
+print("\nPaciente registrado vs sin recepcion:")
+df.groupBy("PACIENTE_REGISTRADO", "SIN_RECEPCION").count().orderBy("PACIENTE_REGISTRADO", "SIN_RECEPCION").show()
+
+# Base del analisis: solo servicios con paciente registrado
+df = df.filter("PACIENTE_REGISTRADO = 1").cache()
+print("Servicios con paciente registrado (base del analisis):", df.count())
 
 # ----------------------------------------------------------------------------
 # 3. EDA
 # ----------------------------------------------------------------------------
 def resumen(d, *cols):
     return (d.groupBy(*cols)
-             .agg(F.count("*").alias("total"), F.sum("SIN_TRASLADO").alias("sin_traslado"))
-             .withColumn("pct_sin_traslado", F.round(100 * F.col("sin_traslado") / F.col("total"), 2)))
+             .agg(F.count("*").alias("total"), F.sum("SIN_RECEPCION").alias("sin_recepcion"))
+             .withColumn("pct_sin_recepcion", F.round(100 * F.col("sin_recepcion") / F.col("total"), 2)))
 
 
 print("\n=== 3. EDA ===")
-res = {}
-res["por_tipo_ambulancia"] = resumen(amb, "TIPO_AMBULANCIA")
-if "LOCALIDAD" in amb.columns:
-    res["por_localidad"] = resumen(amb, "LOCALIDAD").orderBy(F.desc("sin_traslado"))
-if "RANGO_EDAD" in amb.columns:
-    res["por_rango_edad"] = resumen(amb, "RANGO_EDAD").orderBy("RANGO_EDAD")
-if "GENERO" in amb.columns:
-    res["por_genero"] = resumen(amb, "GENERO")
-for pc in ["PRIORIDAD_FINAL", "PRIORIDAD"]:
-    if pc in amb.columns:
-        res["por_prioridad"] = resumen(amb, pc)
-        break
-if "HORA" in amb.columns:
-    res["por_hora"] = resumen(amb.filter(F.col("HORA").isNotNull()), "HORA").orderBy("HORA")
+res = {
+    "por_paciente_registrado": resumen(df, "PACIENTE_REGISTRADO"),
+    "por_tipo_incidente": resumen(df, "TIPO_CORTO").orderBy(F.desc("total")),
+    "por_localidad": resumen(df, "LOCALIDAD").orderBy(F.desc("sin_recepcion")),
+    "por_prioridad": resumen(df, "PRIORIDAD_FINAL").orderBy(F.desc("total")),
+    "por_rango_edad": resumen(df, "RANGO_EDAD").orderBy("RANGO_EDAD"),
+    "por_genero": resumen(df, "GENERO"),
+    "por_hora": resumen(df.filter(F.col("HORA").isNotNull()), "HORA").orderBy("HORA"),
+    "por_dia_semana": resumen(df.filter(F.col("DIA_SEMANA").isNotNull()), "DIA_SEMANA"),
+    "tiempo_a_recepcion_por_prioridad": (
+        df.filter(F.col("MIN_A_RECEPCION").isNotNull())
+          .groupBy("PRIORIDAD_FINAL")
+          .agg(F.count("*").alias("servicios"),
+               F.round(F.avg("MIN_A_RECEPCION"), 1).alias("min_promedio"))
+          .orderBy(F.desc("servicios"))),
+}
 
 pdfs = {}
 for nombre, d in res.items():
@@ -174,23 +162,24 @@ for nombre, d in res.items():
 # ----------------------------------------------------------------------------
 # 4. EJEMPLO CON RDDs
 # ----------------------------------------------------------------------------
-if "LOCALIDAD" in amb.columns:
-    print("\n=== 4. RDD: localidades con mas servicios sin traslado ===")
-    rdd = (amb.select("LOCALIDAD", "SIN_TRASLADO").rdd
-              .filter(lambda r: r[0] is not None)
-              .map(lambda r: (r[0], (1, r[1] or 0)))
-              .reduceByKey(lambda a, b: (a[0] + b[0], a[1] + b[1])))
-    top = rdd.map(lambda kv: (kv[0], kv[1][0], kv[1][1])).takeOrdered(10, key=lambda x: -x[2])
-    for loc, tot, sin in top:
-        print("%-25s total=%-6d sin_traslado=%d" % (loc, tot, sin))
+print("\n=== 4. RDD: localidades con mas servicios sin recepcion ===")
+rdd = (df.select("LOCALIDAD", "SIN_RECEPCION").rdd
+         .filter(lambda r: r[0] is not None)
+         .map(lambda r: (r[0], (1, r[1] or 0)))
+         .reduceByKey(lambda a, b: (a[0] + b[0], a[1] + b[1])))
+top = rdd.map(lambda kv: (kv[0], kv[1][0], kv[1][1])).takeOrdered(10, key=lambda x: -x[2])
+for loc, tot, sin in top:
+    print("%-25s total=%-6d sin_recepcion=%d" % (loc, tot, sin))
 
 # ----------------------------------------------------------------------------
 # 5. VISUALIZACION
 # ----------------------------------------------------------------------------
-def grafico(nombre, x, y, titulo, ylabel, horizontal=False, top=None):
-    if nombre not in pdfs:
-        return
+def grafico(nombre, x, y, titulo, ylabel, horizontal=False, top=None, minimo=None):
     p = pdfs[nombre].dropna(subset=[x])
+    if minimo:
+        p = p[p["total"] >= minimo]
+    if y.startswith("pct") and top:
+        p = p.sort_values(y, ascending=False)
     if top:
         p = p.head(top)
     plt.figure(figsize=(9, 5))
@@ -210,20 +199,18 @@ def grafico(nombre, x, y, titulo, ylabel, horizontal=False, top=None):
 
 
 print("\n=== 5. GRAFICOS ===")
-grafico("por_tipo_ambulancia", "TIPO_AMBULANCIA", "pct_sin_traslado",
-        "% de servicios sin traslado por tipo de ambulancia", "% sin traslado")
-grafico("por_localidad", "LOCALIDAD", "sin_traslado",
-        "Top 10 localidades con mas servicios sin traslado", "Servicios sin traslado",
+grafico("por_tipo_incidente", "TIPO_CORTO", "pct_sin_recepcion",
+        "% de servicios sin recepcion por tipo de incidente (min. 30 casos)",
+        "% sin recepcion", horizontal=True, top=12, minimo=30)
+grafico("por_localidad", "LOCALIDAD", "sin_recepcion",
+        "Top 10 localidades con mas servicios sin recepcion", "Servicios sin recepcion",
         horizontal=True, top=10)
-grafico("por_rango_edad", "RANGO_EDAD", "pct_sin_traslado",
-        "% sin traslado por rango de edad", "% sin traslado")
-grafico("por_hora", "HORA", "sin_traslado",
-        "Servicios sin traslado por hora del dia", "Servicios sin traslado")
-if "por_prioridad" in pdfs:
-    pc = pdfs["por_prioridad"].columns[0]
-    grafico("por_prioridad", pc, "pct_sin_traslado",
-            "% sin traslado por prioridad", "% sin traslado")
+grafico("por_prioridad", "PRIORIDAD_FINAL", "pct_sin_recepcion",
+        "% sin recepcion por prioridad", "% sin recepcion")
+grafico("por_rango_edad", "RANGO_EDAD", "pct_sin_recepcion",
+        "% sin recepcion por rango de edad", "% sin recepcion")
+grafico("por_hora", "HORA", "sin_recepcion",
+        "Servicios sin recepcion por hora del dia", "Servicios sin recepcion")
 
 print("\nResultados en la carpeta:", OUT_DIR)
 spark.stop()
-EOF
